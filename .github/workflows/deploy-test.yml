@@ -109,6 +109,9 @@ jobs:
           DEPLOY_LOG=$(mktemp)
           npx wrangler pages deploy apps/web/dist \
             --project-name="${{ vars.CF_PAGES_PROJECT }}" \
+            --branch=head \
+            --commit-hash="${{ steps.sha.outputs.sha }}" \
+            --commit-dirty=false \
             --commit-message="Deploy ${{ steps.sha.outputs.sha }}" | tee "$DEPLOY_LOG"
 
           DEPLOY_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.pages\.dev' "$DEPLOY_LOG" | tail -n 1 || true)
@@ -125,25 +128,48 @@ jobs:
       - name: Smoke test frontend
         env:
           WEB_URL: ${{ vars.WEB_URL }}
+          EXPECTED_SHA: ${{ steps.sha.outputs.sha }}
         run: |
-          URLS=()
-          [ -n "${CF_PAGES_DEPLOY_URL:-}" ] && URLS+=("$CF_PAGES_DEPLOY_URL")
-          [ -n "${WEB_URL:-}" ] && URLS+=("$WEB_URL")
+          if [ -z "${WEB_URL:-}" ]; then
+            echo "::error::WEB_URL is required to verify the custom test domain"
+            exit 1
+          fi
 
-          for url in "${URLS[@]}"; do
-            echo "Smoking frontend: $url"
+          if [ -n "${CF_PAGES_DEPLOY_URL:-}" ]; then
+            echo "Smoking Pages deployment URL: $CF_PAGES_DEPLOY_URL"
             for i in 1 2 3 4 5 6; do
-              HTTP_STATUS=$(curl -L -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$url" || true)
+              HTTP_STATUS=$(curl -L -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$CF_PAGES_DEPLOY_URL" || true)
               if [ "$HTTP_STATUS" = "200" ]; then
-                echo "Frontend smoke test passed for $url (HTTP $HTTP_STATUS)"
+                echo "Pages deployment URL smoke test passed (HTTP $HTTP_STATUS)"
+                break
+              fi
+              echo "Attempt $i for deployment URL: HTTP ${HTTP_STATUS:-curl_failed}, retrying in 10s..."
+              sleep 10
+              if [ "$i" = "6" ]; then
+                echo "::error::Pages deployment URL smoke test failed"
+                exit 1
+              fi
+            done
+          fi
+
+          echo "Verifying custom domain is serving commit $EXPECTED_SHA: $WEB_URL"
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            HTML=$(curl -L -s --connect-timeout 10 --max-time 20 "$WEB_URL/overview" || true)
+            ASSET_PATH=$(printf '%s' "$HTML" | sed -n 's/.*src="\([^"]*assets\/index-[^"]*\.js\)".*/\1/p' | head -n 1)
+
+            if [ -n "$ASSET_PATH" ]; then
+              ASSET_BODY=$(curl -L -s --connect-timeout 10 --max-time 20 "$WEB_URL$ASSET_PATH" || true)
+              if printf '%s' "$ASSET_BODY" | grep -q "$EXPECTED_SHA"; then
+                echo "Custom domain smoke test passed for $WEB_URL (commit $EXPECTED_SHA)"
                 exit 0
               fi
-              echo "Attempt $i for $url: HTTP ${HTTP_STATUS:-curl_failed}, retrying in 10s..."
-              sleep 10
-            done
+            fi
+
+            echo "Attempt $i: custom domain is not serving $EXPECTED_SHA yet, retrying in 10s..."
+            sleep 10
           done
 
-          echo "::error::Frontend smoke test failed for all candidate URLs"
+          echo "::error::Custom domain did not serve expected commit $EXPECTED_SHA"
           exit 1
 
   deploy-api:
